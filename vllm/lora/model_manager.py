@@ -5,6 +5,7 @@ import math
 from collections.abc import Callable
 from typing import TypeVar
 
+import regex as re
 import torch
 from torch import nn
 
@@ -486,8 +487,14 @@ class LoRAModelManager:
         # such as BERT's pooler.dense. Adapters with LoRA on them are refused.
         self.unsupported_lora_modules: set[str] = set()
 
+        module_filter = getattr(self.model, "lora_module_filter", None)
         for module_name, module in self.model.named_modules(remove_duplicate=False):
             if isinstance(module, PPMissingLayer):
+                continue
+
+            if module_filter is not None and not re.fullmatch(
+                module_filter, module_name
+            ):
                 continue
 
             is_classifier_head = module_name in self.supported_modules_to_save

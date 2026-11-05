@@ -149,6 +149,7 @@ class WorkerLoRAManager:
                 skip_prefixes=lora_skip_prefixes,
                 moe_ep_spec=self._adapter_manager.moe_ep_load_spec,
                 unsupported_lora_modules=self._adapter_manager.unsupported_lora_modules,
+                lora_module_filter=getattr(model, "lora_module_filter", None),
             )
             # Stamp the on-disk MoE layout onto the loaded model so the
             # adapter manager can route 3D-format checkpoints through the

@@ -737,6 +737,11 @@ class SupportsLoRA(Protocol):
     packed_modules_mapping: dict[str, list[str]] = {}
     # Module prefixes to skip during LoRA loading (e.g., ["mtp."] for MTP layers)
     lora_skip_prefixes: ClassVar[list[str]] = []
+    lora_module_filter: ClassVar[str | None] = None
+    """Optional full-match regex restricting runtime and adapter module names.
+
+    Adapter weights outside this filter are rejected, rather than skipped.
+    """
     lora_manager: "LoRAModelManager | None" = None
 
 

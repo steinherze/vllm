@@ -4,6 +4,7 @@
 import os
 from dataclasses import dataclass
 
+import regex as re
 import safetensors
 import torch
 
@@ -208,6 +209,7 @@ class LoRAModel:
         skip_prefixes: list[str] | None = None,
         moe_ep_spec: MoEEPLoadSpec | None = None,
         unsupported_lora_modules: set[str] | None = None,
+        lora_module_filter: str | None = None,
     ) -> "LoRAModel":
         """Create a LoRAModel from a local checkpoint.
 
@@ -235,6 +237,8 @@ class LoRAModel:
             unsupported_lora_modules: Full names of model layers that match
                 expected_lora_modules but are not wrapped by LoRA, such as
                 BERT's pooler.dense. LoRA weights on them are unexpected.
+            lora_module_filter: Optional full-match regex for supported adapter
+                module names. Weights outside this scope are rejected.
 
         Returns:
             Loaded LoRA Model.
@@ -249,11 +253,13 @@ class LoRAModel:
 
         def check_unexpected_modules(modules: dict):
             for lora_module in modules.keys():  # noqa
-                if is_base_embedding_weights(lora_module):
+                if lora_module_filter is None and is_base_embedding_weights(
+                    lora_module
+                ):
                     continue
                 # Handle PEFT file format where experts.base_layer is the
                 # gate_up_proj and experts is the down_proj
-                if "base_layer" in lora_module:
+                if lora_module_filter is None and "base_layer" in lora_module:
                     continue
                 # Skip modules based on model-defined prefixes
                 if skip_prefixes and cls._should_skip_module(
@@ -261,6 +267,11 @@ class LoRAModel:
                 ):
                     continue
                 module_name, _ = parse_fine_tuned_lora_name(lora_module, weights_mapper)
+                if lora_module_filter is not None and not re.fullmatch(
+                    lora_module_filter, module_name
+                ):
+                    unexpected_modules.append(module_name)
+                    continue
                 base_name = module_name.rsplit(".", 1)[-1]
                 # Case for expert lora weights
                 if ".experts" in module_name:

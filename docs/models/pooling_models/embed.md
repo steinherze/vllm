@@ -90,6 +90,7 @@ You can compute pairwise similarity scores to build a similarity matrix using th
 | Architecture | Models | Inputs | Example HF Models | [LoRA](../../features/lora.md) | [PP](../../serving/parallelism_scaling.md) |
 | ------------ | ------ | ------ | ----------------- | ------------------------------ | ------------------------------------------ |
 | `CLIPModel` | CLIP | T / I | `openai/clip-vit-base-patch32`, `openai/clip-vit-large-patch14`, etc. | | |
+| `EmbeddingGemma2Model` | EmbeddingGemma 2 | T / I / A / V | `google/embeddinggemma-2` | Text attention/MLP only (see below) | |
 | `LlamaNemotronVLModel` | Llama Nemotron Embedding + SigLIP | T + I | `nvidia/llama-nemotron-embed-vl-1b-v2` | | |
 | `LlavaNextForConditionalGeneration`<sup>C</sup> | LLaVA-NeXT-based | T / I | `royokong/e5-v` | | ✅︎ |
 | `Phi3VForCausalLM`<sup>C</sup> | Phi-3-Vision-based | T + I | `TIGER-Lab/VLM2Vec-Full` | | ✅︎ |
@@ -139,6 +140,52 @@ print(f"Embeddings: {embeds!r} (size={len(embeds)})")
 ```
 
 A code example can be found here: [examples/basic/offline_inference/embed.py](../../../examples/basic/offline_inference/embed.py)
+
+#### EmbeddingGemma 2 text LoRA
+
+Enable text LoRA for `google/embeddinggemma-2` with `enable_lora=True`, then pass
+a PEFT adapter directory using `LoRARequest` to `LLM.embed()`. Without a
+`lora_request`, the request uses the base model. LoRA is disabled by default.
+
+```python
+from vllm import LLM
+from vllm.lora.request import LoRARequest
+
+llm = LLM(
+    model="google/embeddinggemma-2",
+    runner="pooling",
+    enable_lora=True,
+    max_lora_rank=8,  # Must be at least the adapter's rank.
+    enforce_eager=True,
+    limit_mm_per_prompt={"image": 0, "audio": 0, "video": 0},
+)
+adapter = LoRARequest("text-adapter", 1, "/path/to/peft-adapter")
+outputs = llm.embed(["What is vLLM?"], lora_request=adapter)
+embedding = outputs[0].outputs.embedding
+```
+
+The supported PEFT targets are `q_proj`, `k_proj`, `v_proj`, `o_proj`,
+`gate_proj`, `up_proj`, and `down_proj` under `language_model.layers.*`.
+When creating an adapter with PEFT, restrict `target_modules` to the text
+backbone, for example with this regex:
+
+```python
+target_modules = (
+    r"language_model\.layers\.\d+\."
+    r"(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)"
+)
+```
+
+A suffix-only target list can also select vision/audio layers with matching
+names. Such adapter weights are rejected, including when the checkpoint also
+contains supported text weights. Vision/audio towers, multimodal connectors,
+PLE, `embedding_projection`, embedding layers, and `modules_to_save` are outside
+this support scope. `enable_tower_connector_lora=True` is rejected.
+
+Use an unquantized model on one GPU for validation. Tensor parallelism,
+quantization, and multimodal LoRA require separate validation. Nonzero synthetic
+adapters can test loading and request isolation; evaluating an adapter's retrieval
+quality requires a trained adapter and a representative dataset.
 
 ### `LLM.encode`
 

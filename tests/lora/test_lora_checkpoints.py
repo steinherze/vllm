@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+import torch
+from safetensors.torch import save_file
 
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.utils import parse_fine_tuned_lora_name
+from vllm.model_executor.models.embedding_gemma2 import EmbeddingGemma2Model
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
 from vllm.model_executor.models.utils import WeightsMapper
 
@@ -24,6 +27,48 @@ MOCK_PACKED_MAPPING = {
         "up_proj",
     ],
 }
+
+
+@pytest.mark.parametrize(
+    "extra_module",
+    [
+        None,
+        "vision_tower.encoder.layers.0.self_attn.q_proj",
+        "language_model.layers.0.ple_block.per_layer_input_gate",
+        "language_model.embedding_projection",
+        "language_model.embed_tokens.base_layer",
+    ],
+)
+def test_embedding_gemma2_checkpoint_rejects_partial_lora(tmp_path, extra_module):
+    """Validate full module paths, even when an unsupported target shares a suffix."""
+    module = "language_model.layers.0.self_attn.q_proj"
+    tensors = {
+        f"base_model.model.{name}.lora_{side}.weight": torch.ones(8, 8)
+        for name in [module, *([extra_module] if extra_module else [])]
+        for side in ("A", "B")
+    }
+    if extra_module and extra_module.endswith(".base_layer"):
+        tensors = {
+            name: value for name, value in tensors.items() if extra_module not in name
+        }
+        tensors[f"base_model.model.{extra_module}.weight"] = torch.ones(8, 8)
+    save_file(tensors, tmp_path / "adapter_model.safetensors")
+    kwargs = dict(
+        lora_dir=str(tmp_path),
+        expected_lora_modules={
+            name.split(".")[-1] for name in [module, extra_module or module]
+        },
+        peft_helper=PEFTHelper(r=8, lora_alpha=8, target_modules=["q_proj"]),
+        device="cpu",
+        lora_module_filter=EmbeddingGemma2Model.lora_module_filter,
+    )
+    if extra_module:
+        with pytest.raises(ValueError, match=extra_module):
+            LoRAModel.from_local_checkpoint(**kwargs)
+    else:
+        adapter = LoRAModel.from_local_checkpoint(**kwargs)
+        assert set(adapter.loras) == {module}
+        torch.testing.assert_close(adapter.loras[module].lora_a, torch.ones(8, 8))
 
 
 @pytest.mark.parametrize("lora_name", lora_lst)

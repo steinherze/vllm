@@ -15,6 +15,10 @@ MODEL = os.environ.get("EG2_MODEL_PATH")
 needs_model = pytest.mark.skipif(not MODEL, reason="EG2_MODEL_PATH not set")
 TEXT_COS, MM_COS = 0.999, 0.999
 
+LORA_MODEL = "google/embeddinggemma-2"
+LORA_REVISION = "914f7f89142e33e77833254d9c9b90c3cef7303b"
+LORA_TARGETS = "q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj"
+
 
 def _cos(a, b):
     return torch.nn.functional.cosine_similarity(
@@ -22,6 +26,184 @@ def _cos(a, b):
         torch.tensor(b, dtype=torch.float32),
         dim=-1,
     )
+
+
+@pytest.fixture(scope="module")
+def text_lora_reference(tmp_path_factory):
+    from peft import LoraConfig, get_peft_model
+    from transformers import AutoModel, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(LORA_MODEL, revision=LORA_REVISION)
+    texts = [
+        "task: search result | query: what is vllm",
+        "vLLM is a library for language model inference and serving.",
+        "Paris is the capital of France.",
+        "word " * 520,  # Exercise the sliding-window boundary too.
+    ]
+    prompts = [{"prompt_token_ids": tokenizer.encode(text)} for text in texts]
+    model = AutoModel.from_pretrained(
+        LORA_MODEL, revision=LORA_REVISION, dtype=torch.bfloat16
+    ).eval()
+
+    def embed():
+        embeddings = []
+        with torch.inference_mode():
+            for prompt in prompts:
+                ids = torch.tensor([prompt["prompt_token_ids"]])
+                hidden = model(input_ids=ids).last_hidden_state.float()
+                embeddings.append(torch.nn.functional.normalize(hidden.mean(1), dim=-1))
+        return torch.cat(embeddings).tolist()
+
+    references = [embed()]
+    paths: list[str] = []
+    config = LoraConfig(
+        r=8,
+        lora_alpha=8,
+        target_modules=rf"language_model\.layers\.\d+\.(self_attn|mlp)\.({LORA_TARGETS})",
+        init_lora_weights=False,
+    )
+    for seed in (42, 43):
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            if not paths:
+                model = get_peft_model(model, config, adapter_name=str(seed))
+            else:
+                model.add_adapter(str(seed), config)
+            model.set_adapter(str(seed))
+        model.eval()
+        path = tmp_path_factory.mktemp(f"embedding_gemma2_lora_{seed}")
+        model.save_pretrained(
+            path, selected_adapters=[str(seed)], save_embedding_layers=False
+        )
+        paths.append(str(path / str(seed)))
+        references.append(embed())
+    return texts, prompts, paths, references
+
+
+def test_text_lora_matches_peft_and_isolates_requests(vllm_runner, text_lora_reference):
+    """Nonzero text adapters must match PEFT, including mixed and switched batches."""
+    from tests.models.utils import check_embeddings_close
+    from vllm.lora.request import LoRARequest
+
+    texts, prompts, paths, references = text_lora_reference
+    requests = [
+        None,
+        LoRARequest("first", 1, paths[0]),
+        LoRARequest("second", 2, paths[1]),
+    ]
+    kwargs = dict(
+        runner="pooling",
+        revision=LORA_REVISION,
+        dtype="bfloat16",
+        enforce_eager=True,
+        max_model_len=1024,
+        max_num_seqs=16,
+        max_num_batched_tokens=2048,
+        gpu_memory_utilization=0.8,
+        limit_mm_per_prompt={"image": 0, "audio": 0, "video": 0},
+    )
+    with vllm_runner(LORA_MODEL, **kwargs) as vm:
+        base = vm.embed(texts)
+
+    # Use the model suite's existing BF16 cosine tolerance (0.999). Different
+    # attention/reduction orders accumulate rounding across 24 layers.
+    def check(actual, expected):
+        tensor = torch.tensor(actual)
+        assert tensor.shape == (len(prompts), 768)
+        assert torch.isfinite(tensor).all()
+        torch.testing.assert_close(tensor.norm(dim=-1), torch.ones(len(prompts)))
+        check_embeddings_close(
+            embeddings_0_lst=actual,
+            embeddings_1_lst=expected,
+            name_0="vLLM",
+            name_1="reference",
+            tol=1 - TEXT_COS,
+        )
+
+    with vllm_runner(
+        LORA_MODEL, enable_lora=True, max_loras=2, max_lora_rank=8, **kwargs
+    ) as vm:
+        separate = [vm.embed(prompts, lora_request=request) for request in requests]
+        check(separate[0], base)
+        check(vm.embed(texts, lora_request=requests[1]), separate[1])
+        for actual, expected in zip(separate, references):
+            check(actual, expected)
+        for left, right in ((0, 1), (0, 2), (1, 2)):
+            assert not torch.allclose(
+                torch.tensor(separate[left]), torch.tensor(separate[right])
+            )
+
+        mixed = vm.embed(
+            prompts * 3,
+            lora_request=[request for request in requests for _ in prompts],
+        )
+        for index, expected in enumerate(separate):
+            check(mixed[index * len(prompts) : (index + 1) * len(prompts)], expected)
+        for index in (2, 1, 0, 1):
+            check(vm.embed(prompts, lora_request=requests[index]), separate[index])
+
+
+def test_text_lora_rejects_partial_unsupported_adapters(
+    vllm_runner, text_lora_reference, tmp_path
+):
+    """An adapter with a valid text delta and an unsupported delta must fail whole."""
+    import json
+    from pathlib import Path
+
+    from safetensors.torch import load_file, save_file
+
+    from vllm.lora.request import LoRARequest
+
+    _, _, paths, _ = text_lora_reference
+    source = Path(paths[0])
+    tensors = load_file(source / "adapter_model.safetensors")
+    config = json.loads((source / "adapter_config.json").read_text())
+    unsupported = [
+        "vision_tower.encoder.layers.0.self_attn.q_proj",
+        "audio_tower.layers.0.self_attn.q_proj",
+        "embed_vision.embedding_projection",
+        "embed_audio.embedding_projection",
+        "language_model.layers.0.ple_block.per_layer_input_gate",
+        "language_model.ple.per_layer_model_projection",
+        "language_model.embedding_projection",
+        "language_model.embed_tokens",
+    ]
+    with vllm_runner(
+        LORA_MODEL,
+        revision=LORA_REVISION,
+        runner="pooling",
+        enable_lora=True,
+        max_lora_rank=8,
+        enforce_eager=True,
+        max_model_len=1024,
+        max_num_seqs=16,
+        max_num_batched_tokens=2048,
+        gpu_memory_utilization=0.8,
+        limit_mm_per_prompt={"image": 0, "audio": 0, "video": 0},
+    ) as vm:
+        for index, module in enumerate(unsupported, start=1):
+            path = tmp_path / str(index)
+            path.mkdir()
+            (path / "adapter_config.json").write_text(json.dumps(config))
+            # Shapes are immaterial: validation must reject these before wrapping.
+            extra = {
+                f"base_model.model.{module}.lora_{side}.weight": torch.ones(8, 8)
+                for side in ("A", "B")
+            }
+            save_file(tensors | extra, path / "adapter_model.safetensors")
+            with pytest.raises(Exception, match=module):
+                vm.llm.llm_engine.add_lora(LoRARequest(str(index), index, str(path)))
+        for index, module in enumerate(("embedding_projection", "classifier"), start=9):
+            path = tmp_path / str(index)
+            path.mkdir()
+            (path / "adapter_config.json").write_text(
+                json.dumps(config | {"modules_to_save": [module]})
+            )
+            extra = {f"base_model.model.{module}.weight": torch.ones(8, 8)}
+            save_file(tensors | extra, path / "adapter_model.safetensors")
+            with pytest.raises(Exception, match=module):
+                vm.llm.llm_engine.add_lora(LoRARequest(str(index), index, str(path)))
+        assert not vm.llm.llm_engine.list_loras()
 
 
 def _ensure_synthetic_video(

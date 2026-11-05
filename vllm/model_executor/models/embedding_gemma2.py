@@ -48,7 +48,7 @@ from vllm.model_executor.models.gemma4_mm import (
     Gemma4ProcessingInfo,
     _get_max_soft_tokens,
 )
-from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsMultiModal
 from vllm.model_executor.models.interfaces_base import (
     VllmModelForPooling,
     default_pooling_type,
@@ -978,10 +978,17 @@ def _embedding_gemma2_weights_mapper(
     dummy_inputs=EmbeddingGemma2DummyInputsBuilder,
 )
 @default_pooling_type(seq_pooling_type="MEAN", tok_pooling_type="ALL")
-class EmbeddingGemma2Model(nn.Module, SupportsMultiModal, VllmModelForPooling):
+class EmbeddingGemma2Model(
+    nn.Module, SupportsMultiModal, SupportsLoRA, VllmModelForPooling
+):
     """Multimodal pooling embedding model supporting text, vision, and audio."""
 
     is_pooling_model = True
+
+    lora_module_filter = (
+        r"language_model\.layers\.\d+\."
+        r"(self_attn\.(q|k|v|qkv|o)_proj|mlp\.(gate|up|gate_up|down)_proj)"
+    )
 
     hf_to_vllm_mapper = _embedding_gemma2_weights_mapper()
     packed_modules_mapping = {
@@ -1031,9 +1038,12 @@ class EmbeddingGemma2Model(nn.Module, SupportsMultiModal, VllmModelForPooling):
         self.vllm_config = vllm_config
         self.hf_to_vllm_mapper = _embedding_gemma2_weights_mapper(config)
         lora_config = vllm_config.lora_config
-        self._enable_mm_lora = bool(
-            lora_config is not None and lora_config.enable_tower_connector_lora
-        )
+        if lora_config is not None and lora_config.enable_tower_connector_lora:
+            raise ValueError(
+                "EmbeddingGemma2 only supports LoRA on text attention and MLP "
+                "projections; enable_tower_connector_lora is not supported."
+            )
+        self._enable_mm_lora = False
 
         tower_quant: QuantizationConfig | None
         if quant_config and quant_config.get_name() in [

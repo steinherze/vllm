@@ -1,0 +1,157 @@
+EmbeddingGemma2 text LoRA: implementation and validation record
+
+Publication status (checked 2026-11-05)
+
+No new PR was opened. The existing open PR #60632 by
+kasperg3 already adds text LoRA for EmbeddingGemma2:
+https://github.com/vllm-project/vllm/pull/60632
+It is not a draft, is not merged, and currently has head 04497da8a89d42dc53c317088ab285a0e335c72a.
+AGENTS.md prohibits opening another PR addressing the same fix.
+This branch preserves the independently implemented patch and its validation.
+
+Our additional scope is strict adapter-target validation, negative checkpoint
+coverage, reproducible two-adapter PEFT parity and automatic CI selection of the
+new tests. The existing PR routes text LoRA with get_mm_mapping(); this patch
+uses an opt-in full-match filter for wrapping and checkpoint loading. These
+extras do not justify a second PR advertising the same model support. Any
+future contribution must be coordinated and scoped around nonduplicated work.
+
+Implementation
+
+- EmbeddingGemma2Model implements SupportsLoRA.
+- Supported text targets: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj,
+  down_proj under language_model.layers.*.
+- Existing qkv_proj and gate_up_proj mappings preserve separate PEFT deltas.
+  Weight names already match vLLM paths; no renaming was added.
+- Optional lora_module_filter on SupportsLoRA restricts wrapping and rejects
+  checkpoint weights outside the model's supported scope before application.
+- Vision/audio towers, connectors, PLE, embedding_projection, embedding layers,
+  modules_to_save and saved base_layer weights are rejected for this model.
+- enable_tower_connector_lora=True is rejected explicitly.
+- Other model classes keep the existing default behavior (filter=None).
+- No scheduler or pooling/model-runner implementation was changed.
+- Rendered docs include the supported targets, limitations and LLM.embed example.
+- Existing test suites and Buildkite dependencies were extended.
+
+Revisions and inputs
+
+Base vLLM commit: 831dd92674c818d7e440e750cbdcc7c9e8f4a97b
+Model: google/embeddinggemma-2
+Model revision: 914f7f89142e33e77833254d9c9b90c3cef7303b
+Validated code-patch SHA256 (git diff --binary --full-index, before this report):
+2a2cfed3cd678a36aa381af4975497cb6904fd96337d5fc069afb2987e61bf96
+
+Two deterministic synthetic PEFT adapters: seeds 42 and 43, r=8, lora_alpha=8,
+bias=none, init_lora_weights=False, modules_to_save=None.
+Each adapter has 336 nonzero tensors: 24 layers x 7 projections x A/B.
+Target regex:
+  language_model\.layers\.\d+\.(self_attn|mlp)\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)
+Tensor names follow:
+  base_model.model.language_model.layers.<layer>.<self_attn|mlp>.<projection>.lora_<A|B>.weight
+These are mechanical test adapters, not trained retrieval adapters.
+
+Preprocessing uses the same tokenizer IDs (14, 15, 9 and 523 tokens), mean
+pooling of projected last_hidden_state with float32 accumulation, then L2
+normalization. The 523-token text crosses the sliding-window boundary.
+Cosine threshold >=0.999 reuses the existing model suite's BF16 tolerance;
+different attention/reduction orders accumulate rounding across 24 layers.
+
+Validation and reproduction
+
+CPU: macOS ARM, PyTorch 2.14.0, Transformers 5.22.1, PEFT 0.21.2.
+CUDA: RTX 3060 Laptop GPU, 6144 MiB, compute capability 8.6; Ubuntu 22.04.5
+under WSL2; driver 610.88; PyTorch 2.14.0+cu130 / CUDA runtime 13.0;
+Transformers 5.22.1 and PEFT 0.21.2.
+One GPU, BF16, no quantization, eager execution, TP=1, max_model_len=1024,
+max_num_seqs=16, max_num_batched_tokens=2048, gpu_memory_utilization=0.8,
+max_loras=2, max_lora_rank=8; image/audio/video limits are zero.
+Actual CUDA backends: TRITON_ATTN and PunicaWrapperGPU.
+The mixed batch has 12 requests and 1683 tokens, within these scheduler limits.
+
+CUDA commands were run from an isolated checkout with .venv/bin on PATH,
+HF_HUB_OFFLINE=1, VLLM_WORKER_MULTIPROC_METHOD=spawn and OMP_NUM_THREADS=4.
+
+1. Baseline checkout, with the new regression test and the same installed
+   native/runtime dependencies:
+   .venv/bin/python -m pytest tests/models/multimodal/pooling/test_embedding_gemma2.py -k test_text_lora_matches_peft_and_isolates_requests -v -s --tb=short
+   Expected failure: 1 failed, 22 deselected in 51.65s. Base GPU embedding
+   succeeded, then enabling LoRA raised:
+   Value error, LoRA is not supported for EmbeddingGemma2Model.
+
+2. Patched checkout:
+   .venv/bin/python -m pytest tests/models/multimodal/pooling/test_embedding_gemma2.py -k text_lora -v -s --tb=short
+   CUDA: 2 passed, 21 deselected in 118.36s.
+   CPU (earlier run): 2 passed, 21 deselected in 223.26s.
+   Covers finite normalized 768-dimensional embeddings, nonzero adapter
+   effects, PEFT parity, base consistency, raw texts versus shared token IDs,
+   mixed requests, adapter switching and atomic refusal of unsupported weights.
+
+3. .venv/bin/python -m pytest tests/lora/test_lora_checkpoints.py -k 'embedding_gemma2 or gemma4' -q --tb=short
+   CUDA host: 7 passed, 5 deselected in 2.24s.
+   Local CPU: 7 passed, 5 deselected in 1.18s.
+
+4. .venv/bin/python -m pytest tests/lora/test_peft_helper.py -q --tb=short
+   Local CPU: 41 passed.
+
+5. .venv/bin/python -m pre_commit run --files .buildkite/test_areas/lora.yaml docs/models/pooling_models/embed.md tests/lora/test_lora_checkpoints.py tests/models/multimodal/pooling/test_embedding_gemma2.py vllm/lora/lora_model.py vllm/lora/model_manager.py vllm/lora/worker_manager.py vllm/model_executor/models/embedding_gemma2.py vllm/model_executor/models/interfaces.py
+   All applicable hooks passed, including ruff, mypy, Markdown and CI tethering.
+   Checks were repeated after bounding the test batch for 6 GiB VRAM.
+   git diff --check passed.
+
+Numerical evaluation
+
+Evaluated the base and both adapters against Transformers+PEFT on CUDA.
+Minimum cosine over all inputs: 0.999232173 (threshold >=0.999).
+Minimum cosine against the earlier PEFT CPU references: 0.999439001.
+Maximum absolute component error against PEFT CUDA: 0.003969975.
+Earlier CPU vLLM versus CPU PEFT minimum cosine: 0.999128044.
+
+Minimum CUDA cosine per configuration:
+  base: 0.999909937
+  seed42: 0.999232173
+  seed43: 0.999701381
+
+Tiny retrieval smoke (one query, relevant vLLM document and unrelated France document):
+  base: vLLM CUDA scores=[0.7738252282142639, 0.49179404973983765]; PEFT CUDA scores=[0.7725942134857178, 0.49088892340660095]; R@1=1.0
+  seed42: vLLM CUDA scores=[0.7750312089920044, 0.599273145198822]; PEFT CUDA scores=[0.7740912437438965, 0.5986785888671875]; R@1=1.0
+  seed43: vLLM CUDA scores=[0.7704923152923584, 0.641417920589447]; PEFT CUDA scores=[0.772157609462738, 0.6401071548461914]; R@1=1.0
+This verifies a tiny mechanical example only; no trained adapter or target
+quality dataset was supplied. Trained-adapter retrieval quality is unassessed.
+TP, quantization, CUDA graphs and multimodal LoRA were not validated.
+
+Persistent evidence
+
+Local detailed artifacts, including full logs, configs, tensor names, adapter
+hashes, numerical outputs and standalone evaluation scripts:
+  /private/tmp/embedding_gemma2_lora_validation/
+The CUDA environment, baseline checkout, adapters and full logs also remain in:
+  /home/developer/embedding_gemma2_lora_validation/
+The GPU was verified free after completion (0 MiB allocated, 0% utilization).
+
+pr-checklist review notes
+
+1. Design fit: roughly 40 production-code additions; the optional filter is
+   evaluated only during model setup/checkpoint loading. Existing mappings and
+   runner plumbing are reused. No per-token Python work, host synchronization,
+   new dependency or kernel/scheduler/runner change is introduced.
+2. Testing: real LLM.embed reproducer fails on the baseline and passes with the
+   patch; seeded nonzero adapters cover numerical behavior and request isolation.
+   Fast checkpoint tests independently cover strict scope rejection. The pooling
+   integration suite is selected by the existing extended/nightly Buildkite step;
+   checkpoint tests are selected by the LoRA step. No new skips/reruns or wider
+   tolerances were added. ROCm and the other modes listed above remain untested.
+3. Quality/docs: existing style and helpers are reused; pre-commit passes; the
+   feature is documented under pooling model usages and in the model table.
+   The task input file remains separate from this implementation/report.
+4. PR contents: BLOCKED. Public API searches found open PR #60632 implementing
+   the same model support. No truthful nonduplication claim can be made for a
+   second support PR. AGENTS.md requires coordination instead of duplication.
+   GitHub CLI was installed, but is not authenticated; the required live read
+   was completed through the public API, not through gh. No PR or public comment
+   was created. Any later upstream submission also requires a human to review
+   every changed line, run the relevant tests, and understand the change.
+
+AI assistance
+
+OpenAI Codex implemented the patch, prepared the tests/docs and ran the recorded
+validation. Human review/test attestation is not claimed in this report.
